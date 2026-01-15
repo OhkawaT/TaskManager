@@ -283,6 +283,7 @@ public sealed class NoteItem : INotifyPropertyChanged
 {
     private string _title = string.Empty;
     private string _content = string.Empty;
+    private string _folder = string.Empty;
 
     public string Title
     {
@@ -296,10 +297,33 @@ public sealed class NoteItem : INotifyPropertyChanged
         set => SetField(ref _content, value ?? string.Empty, nameof(Content));
     }
 
+    public string Folder
+    {
+        get => _folder;
+        set => SetField(ref _folder, NormalizeFolderPath(value), nameof(Folder));
+    }
+
+    internal static string NormalizeFolderPath(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var normalized = value.Trim().Replace('\\', '/').Trim('/');
+        while (normalized.Contains("//", StringComparison.Ordinal))
+        {
+            normalized = normalized.Replace("//", "/", StringComparison.Ordinal);
+        }
+
+        return normalized;
+    }
+
     public void Normalize()
     {
         _title = string.IsNullOrWhiteSpace(_title) ? "無題" : _title.Trim();
         _content = _content ?? string.Empty;
+        _folder = NormalizeFolderPath(_folder);
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -321,6 +345,8 @@ public sealed class MainForm : Form
 {
     private const string AppName = "枯乃葉のタスク管理";
     private const int ActionMenuSwitchWidth = 760;
+    private const int NotesListMinWidth = 200;
+    private const int NotesEditorMinWidth = 260;
     private const float NoteZoomStep = 0.1f;
     private const float NoteZoomMin = 0.6f;
     private const float NoteZoomMax = 2.0f;
@@ -347,18 +373,18 @@ public sealed class MainForm : Form
     private readonly BindingSource _activeBindingSource;
     private readonly BindingSource _completedBindingSource;
     private readonly BindingList<NoteItem> _notes;
-    private readonly BindingSource _notesBindingSource;
     private readonly TextBox _titleInput;
     private readonly TextBox _memoInput;
     private readonly DateTimePicker _duePicker;
     private readonly NumericUpDown _progressInput;
     private readonly Button _addButton;
+    private ComboBox _noteFolderInput = null!;
     private TextBox _noteTitleInput = null!;
     private RichTextBox _noteBodyInput = null!;
     private Button _noteSaveButton = null!;
     private Button _noteNewButton = null!;
     private Button _noteDeleteButton = null!;
-    private ListBox _notesListBox = null!;
+    private TreeView _notesTreeView = null!;
     private Button _noteBoldButton = null!;
     private Button _noteUnderlineButton = null!;
     private Button _noteStrikeButton = null!;
@@ -405,6 +431,8 @@ public sealed class MainForm : Form
     private bool _allowExit;
     private bool _suppressSave;
     private bool _suppressNoteSave;
+    private bool _suppressNoteTreeSelection;
+    private bool _notesSplitterInitialized;
     private bool _trayTipShown;
     private bool _suppressMove;
     private NoteItem? _selectedNote;
@@ -458,7 +486,6 @@ public sealed class MainForm : Form
         _completedBindingSource = new BindingSource { DataSource = _completedTasks };
         _notes = new BindingList<NoteItem>();
         _notes.ListChanged += Notes_ListChanged;
-        _notesBindingSource = new BindingSource { DataSource = _notes };
 
         _titleInput = new TextBox
         {
@@ -754,19 +781,23 @@ public sealed class MainForm : Form
         headerPanel.Controls.Add(headerLabel);
         headerPanel.Controls.Add(hintLabel);
 
-        var contentLayout = new TableLayoutPanel
+        var contentLayout = new SplitContainer
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 2,
-            RowCount = 1
+            Orientation = Orientation.Vertical,
+            SplitterWidth = 6,
+            BackColor = BackgroundColor,
+            BorderStyle = BorderStyle.None
         };
-        contentLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 36f));
-        contentLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 64f));
+        contentLayout.Panel1.Padding = new Padding(0, 8, 8, 0);
+        contentLayout.Panel2.Padding = new Padding(8, 8, 0, 0);
+        contentLayout.HandleCreated += (_, _) => EnsureNotesSplitterDistance(contentLayout, preferInitialSplit: true);
+        contentLayout.SizeChanged += (_, _) => EnsureNotesSplitterDistance(contentLayout, preferInitialSplit: false);
 
         var listCard = CreateCardPanel();
         listCard.Dock = DockStyle.Fill;
         listCard.Padding = new Padding(12);
-        listCard.Margin = new Padding(0, 8, 8, 0);
+        listCard.Margin = new Padding(0);
 
         var listLayout = new TableLayoutPanel
         {
@@ -785,33 +816,35 @@ public sealed class MainForm : Form
             ForeColor = TextColor
         };
 
-        _notesListBox = new ListBox
+        _notesTreeView = new TreeView
         {
             Dock = DockStyle.Fill,
             BorderStyle = BorderStyle.None,
             BackColor = Color.White,
             ForeColor = TextColor,
             Font = _baseFont,
-            IntegralHeight = false,
-            DataSource = _notesBindingSource,
-            DisplayMember = nameof(NoteItem.Title)
+            HideSelection = false,
+            FullRowSelect = true,
+            ShowLines = true,
+            ShowPlusMinus = true,
+            ShowRootLines = true
         };
-        _notesListBox.SelectedIndexChanged += NotesListBox_SelectedIndexChanged;
+        _notesTreeView.AfterSelect += NotesTreeView_AfterSelect;
 
         listLayout.Controls.Add(listLabel, 0, 0);
-        listLayout.Controls.Add(_notesListBox, 0, 1);
+        listLayout.Controls.Add(_notesTreeView, 0, 1);
         listCard.Controls.Add(listLayout);
 
         var editorCard = CreateCardPanel();
         editorCard.Dock = DockStyle.Fill;
         editorCard.Padding = new Padding(12);
-        editorCard.Margin = new Padding(8, 8, 0, 0);
+        editorCard.Margin = new Padding(0);
 
         var editorLayout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             ColumnCount = 2,
-            RowCount = 5,
+            RowCount = 6,
             Padding = new Padding(4, 2, 4, 2)
         };
         editorLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -819,8 +852,27 @@ public sealed class MainForm : Form
         editorLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         editorLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         editorLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        editorLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         editorLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
         editorLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        var noteFolderLabel = new Label
+        {
+            Text = "フォルダ",
+            AutoSize = true,
+            Anchor = AnchorStyles.Left
+        };
+
+        _noteFolderInput = new ComboBox
+        {
+            Dock = DockStyle.Fill,
+            BackColor = Color.White,
+            ForeColor = TextColor,
+            DropDownStyle = ComboBoxStyle.DropDown,
+            AutoCompleteMode = AutoCompleteMode.SuggestAppend,
+            AutoCompleteSource = AutoCompleteSource.ListItems,
+            IntegralHeight = false
+        };
 
         var noteTitleLabel = new Label
         {
@@ -1114,21 +1166,23 @@ public sealed class MainForm : Form
         footerLayout.Controls.Add(_noteToastLabel, 0, 0);
         footerLayout.Controls.Add(buttonPanel, 1, 0);
 
-        editorLayout.Controls.Add(noteTitleLabel, 0, 0);
-        editorLayout.Controls.Add(_noteTitleInput, 1, 0);
-        editorLayout.Controls.Add(noteBodyLabel, 0, 1);
+        editorLayout.Controls.Add(noteFolderLabel, 0, 0);
+        editorLayout.Controls.Add(_noteFolderInput, 1, 0);
+        editorLayout.Controls.Add(noteTitleLabel, 0, 1);
+        editorLayout.Controls.Add(_noteTitleInput, 1, 1);
+        editorLayout.Controls.Add(noteBodyLabel, 0, 2);
         editorLayout.SetColumnSpan(noteBodyLabel, 2);
-        editorLayout.Controls.Add(formatPanel, 0, 2);
+        editorLayout.Controls.Add(formatPanel, 0, 3);
         editorLayout.SetColumnSpan(formatPanel, 2);
-        editorLayout.Controls.Add(_noteBodyInput, 0, 3);
+        editorLayout.Controls.Add(_noteBodyInput, 0, 4);
         editorLayout.SetColumnSpan(_noteBodyInput, 2);
-        editorLayout.Controls.Add(footerLayout, 0, 4);
+        editorLayout.Controls.Add(footerLayout, 0, 5);
         editorLayout.SetColumnSpan(footerLayout, 2);
 
         editorCard.Controls.Add(editorLayout);
 
-        contentLayout.Controls.Add(listCard, 0, 0);
-        contentLayout.Controls.Add(editorCard, 1, 0);
+        contentLayout.Panel1.Controls.Add(listCard);
+        contentLayout.Panel2.Controls.Add(editorCard);
 
         layout.Controls.Add(headerPanel, 0, 0);
         layout.Controls.Add(contentLayout, 0, 1);
@@ -1775,6 +1829,7 @@ public sealed class MainForm : Form
         finally
         {
             _suppressNoteSave = false;
+            RefreshNotesTree();
         }
     }
 
@@ -1810,24 +1865,35 @@ public sealed class MainForm : Form
         }
 
         SaveNotes();
+        RefreshNotesTree();
     }
 
-    private void NotesListBox_SelectedIndexChanged(object? sender, EventArgs e)
+    private void NotesTreeView_AfterSelect(object? sender, TreeViewEventArgs e)
     {
+        if (_suppressNoteTreeSelection)
+        {
+            return;
+        }
+
         AutoSaveNoteDraft(showToast: false, showTrayNotification: false, keepSelection: true);
 
-        if (_notesListBox.SelectedItem is not NoteItem note)
+        if (e.Node?.Tag is not NoteItem note)
         {
             _selectedNote = null;
             _noteTitleInput.Clear();
             _noteBodyInput.Clear();
             UpdateNoteZoom(1.0f);
             UpdateNoteFormatButtons();
+            if (e.Node?.Tag is string folderPath)
+            {
+                _noteFolderInput.Text = folderPath;
+            }
             return;
         }
 
         _selectedNote = note;
         _noteTitleInput.Text = note.Title;
+        _noteFolderInput.Text = note.Folder;
         if (!string.IsNullOrWhiteSpace(note.Content) && note.Content.StartsWith("{\\rtf", StringComparison.Ordinal))
         {
             try
@@ -1847,6 +1913,226 @@ public sealed class MainForm : Form
         UpdateNoteFormatButtons();
     }
 
+    private void RefreshNotesTree()
+    {
+        if (_notesTreeView is null)
+        {
+            return;
+        }
+
+        object? selectionTag = _notesTreeView.SelectedNode?.Tag ?? _selectedNote;
+        _suppressNoteTreeSelection = true;
+        _notesTreeView.BeginUpdate();
+        _notesTreeView.Nodes.Clear();
+
+        var folderNodes = new Dictionary<string, TreeNode>(StringComparer.Ordinal);
+        var folderPaths = new SortedSet<string>(StringComparer.CurrentCulture);
+        foreach (var _note in _notes)
+        {
+            var folderPath = NoteItem.NormalizeFolderPath(_note.Folder);
+            TreeNode? parentNode = null;
+            if (!string.IsNullOrWhiteSpace(folderPath))
+            {
+                var currentPath = string.Empty;
+                foreach (var part in folderPath.Split('/', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    currentPath = string.IsNullOrEmpty(currentPath) ? part : $"{currentPath}/{part}";
+                    folderPaths.Add(currentPath);
+                    if (!folderNodes.TryGetValue(currentPath, out var folderNode))
+                    {
+                        folderNode = new TreeNode(part) { Tag = currentPath };
+                        if (parentNode is null)
+                        {
+                            _notesTreeView.Nodes.Add(folderNode);
+                        }
+                        else
+                        {
+                            parentNode.Nodes.Add(folderNode);
+                        }
+
+                        folderNodes[currentPath] = folderNode;
+                    }
+
+                    parentNode = folderNode;
+                }
+            }
+
+            var noteNode = new TreeNode(_note.Title) { Tag = _note };
+            if (parentNode is null)
+            {
+                _notesTreeView.Nodes.Add(noteNode);
+            }
+            else
+            {
+                parentNode.Nodes.Add(noteNode);
+            }
+        }
+
+        _notesTreeView.EndUpdate();
+
+        if (_noteFolderInput is not null)
+        {
+            var currentFolder = _noteFolderInput.Text;
+            _noteFolderInput.BeginUpdate();
+            _noteFolderInput.Items.Clear();
+            foreach (var path in folderPaths)
+            {
+                _noteFolderInput.Items.Add(path);
+            }
+            _noteFolderInput.EndUpdate();
+            if (!string.IsNullOrWhiteSpace(currentFolder))
+            {
+                _noteFolderInput.Text = currentFolder;
+            }
+        }
+
+        if (selectionTag is NoteItem note)
+        {
+            SelectNoteNode(note);
+        }
+        else if (selectionTag is string folderPath)
+        {
+            SelectFolderNode(folderPath);
+        }
+
+        _suppressNoteTreeSelection = false;
+    }
+
+    private void EnsureNotesSplitterDistance(SplitContainer container, bool preferInitialSplit)
+    {
+        if (container.Width <= 0)
+        {
+            return;
+        }
+
+        var required = NotesListMinWidth + NotesEditorMinWidth + container.SplitterWidth;
+        if (container.Width < required)
+        {
+            return;
+        }
+
+        if (container.Panel1MinSize != NotesListMinWidth)
+        {
+            container.Panel1MinSize = NotesListMinWidth;
+        }
+
+        if (container.Panel2MinSize != NotesEditorMinWidth)
+        {
+            container.Panel2MinSize = NotesEditorMinWidth;
+        }
+
+        var min = container.Panel1MinSize;
+        var max = container.Width - container.Panel2MinSize - container.SplitterWidth;
+        if (max < min)
+        {
+            return;
+        }
+
+        var desired = container.SplitterDistance;
+        if (!_notesSplitterInitialized || preferInitialSplit)
+        {
+            desired = (int)Math.Round(container.Width * 0.36f);
+            _notesSplitterInitialized = true;
+        }
+
+        desired = Math.Clamp(desired, min, max);
+        if (container.SplitterDistance != desired)
+        {
+            container.SplitterDistance = desired;
+        }
+    }
+
+    private void ClearNoteSelection()
+    {
+        if (_notesTreeView is null)
+        {
+            return;
+        }
+
+        _suppressNoteTreeSelection = true;
+        _notesTreeView.SelectedNode = null;
+        _suppressNoteTreeSelection = false;
+    }
+
+    private void SelectNoteNode(NoteItem note)
+    {
+        if (_notesTreeView is null)
+        {
+            return;
+        }
+
+        var node = FindNoteNode(_notesTreeView.Nodes, note);
+        if (node is null)
+        {
+            return;
+        }
+
+        _notesTreeView.SelectedNode = node;
+        node.EnsureVisible();
+    }
+
+    private void SelectFolderNode(string folderPath)
+    {
+        if (_notesTreeView is null)
+        {
+            return;
+        }
+
+        var normalized = NoteItem.NormalizeFolderPath(folderPath);
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return;
+        }
+
+        var node = FindFolderNode(_notesTreeView.Nodes, normalized);
+        if (node is null)
+        {
+            return;
+        }
+
+        _notesTreeView.SelectedNode = node;
+        node.Expand();
+        node.EnsureVisible();
+    }
+
+    private static TreeNode? FindNoteNode(TreeNodeCollection nodes, NoteItem note)
+    {
+        foreach (TreeNode node in nodes)
+        {
+            if (ReferenceEquals(node.Tag, note))
+            {
+                return node;
+            }
+
+            var child = FindNoteNode(node.Nodes, note);
+            if (child is not null)
+            {
+                return child;
+            }
+        }
+
+        return null;
+    }
+
+    private static TreeNode? FindFolderNode(TreeNodeCollection nodes, string folderPath)
+    {
+        foreach (TreeNode node in nodes)
+        {
+            if (node.Tag is string tag && string.Equals(tag, folderPath, StringComparison.Ordinal))
+            {
+                return node;
+            }
+
+            var child = FindFolderNode(node.Nodes, folderPath);
+            if (child is not null)
+            {
+                return child;
+            }
+        }
+
+        return null;
+    }
+
     private void SaveNote()
     {
         var title = _noteTitleInput.Text.Trim();
@@ -1858,26 +2144,28 @@ public sealed class MainForm : Form
         }
 
         var content = _noteBodyInput.Rtf ?? string.Empty;
+        var folder = NoteItem.NormalizeFolderPath(_noteFolderInput.Text);
 
         if (_selectedNote is null)
         {
-            var note = new NoteItem { Title = title, Content = content };
+            var note = new NoteItem { Title = title, Content = content, Folder = folder };
             note.Normalize();
+            _selectedNote = note;
             _notes.Add(note);
-            _notesListBox.SelectedItem = note;
             ShowNoteToast("保存しました");
             return;
         }
 
         _selectedNote.Title = title;
         _selectedNote.Content = content;
+        _selectedNote.Folder = folder;
         ShowNoteToast("保存しました");
     }
 
     private void CreateNewNote()
     {
         AutoSaveNoteDraft(showToast: false, showTrayNotification: false, keepSelection: false);
-        _notesListBox.ClearSelected();
+        ClearNoteSelection();
         _selectedNote = null;
         _noteTitleInput.Clear();
         _noteBodyInput.Clear();
@@ -1902,6 +2190,7 @@ public sealed class MainForm : Form
 
         _notes.Remove(_selectedNote);
         _selectedNote = null;
+        ClearNoteSelection();
         _noteTitleInput.Clear();
         _noteBodyInput.Clear();
         UpdateNoteZoom(1.0f);
@@ -2002,7 +2291,7 @@ public sealed class MainForm : Form
 
     private void AutoSaveNoteDraft(bool showToast, bool showTrayNotification, bool keepSelection)
     {
-        if (_noteTitleInput is null || _noteBodyInput is null || _notesListBox is null)
+        if (_noteTitleInput is null || _noteBodyInput is null || _noteFolderInput is null || _notesTreeView is null)
         {
             return;
         }
@@ -2016,11 +2305,13 @@ public sealed class MainForm : Form
 
         var content = _noteBodyInput.Rtf ?? string.Empty;
         var normalizedTitle = string.IsNullOrWhiteSpace(title) ? "無題" : title;
+        var normalizedFolder = NoteItem.NormalizeFolderPath(_noteFolderInput.Text);
 
         var isNew = _selectedNote is null;
         var isChanged = isNew
             || !string.Equals(_selectedNote!.Title, normalizedTitle, StringComparison.Ordinal)
-            || !string.Equals(_selectedNote.Content, content, StringComparison.Ordinal);
+            || !string.Equals(_selectedNote.Content, content, StringComparison.Ordinal)
+            || !string.Equals(_selectedNote.Folder, normalizedFolder, StringComparison.Ordinal);
         if (!isChanged)
         {
             return;
@@ -2028,19 +2319,16 @@ public sealed class MainForm : Form
 
         if (isNew)
         {
-            var note = new NoteItem { Title = normalizedTitle, Content = content };
+            var note = new NoteItem { Title = normalizedTitle, Content = content, Folder = normalizedFolder };
             note.Normalize();
-            _notes.Add(note);
             _selectedNote = note;
-            if (!keepSelection && _notesListBox.SelectedItem is null)
-            {
-                _notesListBox.SelectedItem = note;
-            }
+            _notes.Add(note);
         }
         else
         {
             _selectedNote!.Title = normalizedTitle;
             _selectedNote.Content = content;
+            _selectedNote.Folder = normalizedFolder;
         }
 
         if (showToast)
